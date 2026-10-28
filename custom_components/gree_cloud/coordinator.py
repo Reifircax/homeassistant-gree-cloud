@@ -33,6 +33,7 @@ from .const import (
     HWHP_PROP_POW_CONSUMP,
     HWHP_PROP_SET_TEM_DEC,
     HWHP_PROP_SET_TEM_INT,
+    HWHP_PROP_WATER_PERCENT,
     HWHP_PROP_WATER_TEMP,
     HWHP_PROP_WSTATE,
     MAX_ERRORS,
@@ -52,6 +53,7 @@ _HWHP_EXTRA_PROPS = [
     HWHP_PROP_SET_TEM_DEC,
     HWHP_PROP_WSTATE,
     HWHP_PROP_POW_CONSUMP,
+    HWHP_PROP_WATER_PERCENT,
 ]
 
 # Extra properties reported by AC units, surfaced by the sensor platform. The
