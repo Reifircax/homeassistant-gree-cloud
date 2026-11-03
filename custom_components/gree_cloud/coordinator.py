@@ -134,27 +134,21 @@ class HWHPAwareCloudDevice(CloudDevice):
                 command = prepare_command(self.raw_properties, self.write_policy, key, value)
             except ValueError as err:
                 raise HomeAssistantError(str(err)) from err
-            if self.uses_mqtt and not self._mqtt_client.is_connected:
-                raise HomeAssistantError("MQTT disconnected; command was not sent")
             # Only allowlisted user commands can reach the transport.
             try:
-                self._strict_command_reply = True
-                reply = await (self._mqtt_request(command, self._command_timeout)
-                               if self.uses_mqtt else self._gateway.request(
-                                   self._child_mac, self._gateway_cipher(), command))
+                reply = await self.send_command(
+                    command["opt"], command["p"], strict_ack=True
+                )
                 verify_command_reply(reply, key, command["p"][0])
             except (ValueError, asyncio.TimeoutError) as err:
                 raise HomeAssistantError("Command not confirmed; it may have executed. No retry.") from err
-            finally:
-                self._strict_command_reply = False
             # Cloud state can lag behind the ACK, or a late bare ACK can wake
             # the status request. Retry reads only, never the accepted write.
             for attempt in range(3):
                 if attempt:
                     await asyncio.sleep(1)
                 try:
-                    data = await (self._mqtt_request({"t": "status", "cols": list(HEATPUMP_COLUMNS)}, self._command_timeout)
-                                  if self.uses_mqtt else self._gateway_status({"t": "status", "cols": list(HEATPUMP_COLUMNS)}))
+                    data = await self.request_status(list(HEATPUMP_COLUMNS))
                 except asyncio.TimeoutError:
                     continue
                 if isinstance(data, dict) and data.get(key) == command["p"][0]:
@@ -169,22 +163,6 @@ class HWHPAwareCloudDevice(CloudDevice):
             self.handle_state_update(**data)
             return copy.deepcopy(self.raw_properties)
 
-    def _handle_mqtt_message(self, topic, message):
-        """Capture full ACKs only for air-to-water commands; preserve the AC handler."""
-        if getattr(self, "_strict_command_reply", False):
-            if self._parent_mac not in topic and self._child_mac not in topic:
-                return
-            if 'response/' in topic and message.pack and self._response_event:
-                try:
-                    reply = self.device_cipher.decrypt(message.pack)
-                    if reply.get('t') in ('res', 'cmd', 'dat'):
-                        self._response_data = reply
-                        self._response_event.set()
-                except Exception:
-                    pass
-            return  # An unsolicited status must not masquerade as a command ACK.
-        super()._handle_mqtt_message(topic, message)
-
     def _status_columns(self) -> list[str]:
         """Standard properties plus the HWHP and sensor extras."""
         if model_profile(getattr(self, "cloud_mid", None)) is not None:
@@ -193,16 +171,23 @@ class HWHPAwareCloudDevice(CloudDevice):
 
     async def update_state(self) -> None:
         """Read only; reject empty acknowledgements instead of reporting success."""
+        if model_profile(getattr(self, "cloud_mid", None)) is None:
+            self.device_kind = "ac"
+            await super().update_state()
+            return
         async with self.request_lock:
-            if model_profile(getattr(self, "cloud_mid", None)) is None:
-                self.device_kind = "ac"
-                await super().update_state()
-                return
-            command = {"t": "status", "cols": self._status_columns()}
-            data = await (
-                self._mqtt_request(command, self._command_timeout)
-                if self.uses_mqtt else self._gateway_status(command)
-            )
+            data = await self.request_status(self._status_columns())
+            if isinstance(data, dict) and classify(data, mid=self.cloud_mid) == "unknown":
+                if not getattr(self, "_unknown_profile_warned", False):
+                    _LOGGER.warning(
+                        "Model %s has fewer than two usable hydraulic setpoints; "
+                        "the heat-pump profile cannot be recognized from this poll. "
+                        "Received columns: %s",
+                        self.cloud_mid, ", ".join(sorted(data)) or "(none)",
+                    )
+                    self._unknown_profile_warned = True
+            else:
+                self._unknown_profile_warned = False
             if not isinstance(data, dict) or not data or not any(
                 key in data for key in ("Pow", "Mod", "HeWatOutTemSet", "SetTem", "WatTmp")
             ):
@@ -228,8 +213,7 @@ class HWHPAwareCloudDevice(CloudDevice):
         """Never send AC commands to a registered air-to-water heat pump."""
         if model_profile(getattr(self, "cloud_mid", None)) is not None:
             raise HomeAssistantError("This model requires the air-to-water command path")
-        async with self.request_lock:
-            return await super().push_state_update()
+        return await super().push_state_update()
 
 
 def is_hwhp_device(coordinator: "CloudDeviceDataUpdateCoordinator") -> bool:
@@ -323,9 +307,6 @@ class CloudDeviceDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._error_count,
         )
         try:
-            if self.device_kind == "heatpump" and self.device.uses_mqtt and not self.device._mqtt_client.is_connected:
-                if not await _try_reconnect(self.hass, self.config_entry):
-                    raise UpdateFailed("MQTT disconnected")
             await self.device.update_state()
             self._error_count = 0
             _LOGGER.debug(
@@ -444,6 +425,7 @@ class CloudDiscoveryService:
             # Create coordinator for each device
             for cloud_dev_info in cloud_devices:
                 device = None
+                coordinator = None
                 try:
                     # Create DeviceInfo for CloudDevice
                     device_info = DeviceInfo(
@@ -482,9 +464,10 @@ class CloudDiscoveryService:
                         self.hass, self.entry, device
                     )
 
-                    # Initial refresh
-                    await coordinator.async_config_entry_first_refresh()
+                    # Keep the device registered if the initial poll fails;
+                    # subsequent scheduled polls can recover without a restart.
                     coordinators.append(coordinator)
+                    await coordinator.async_config_entry_first_refresh()
 
                     # Notify about discovered device
                     async_dispatcher_send(
@@ -492,7 +475,7 @@ class CloudDiscoveryService:
                     )
 
                 except Exception as err:
-                    if device is not None:
+                    if device is not None and coordinator not in coordinators:
                         await device.close()
                     _LOGGER.exception(
                         "Failed to setup cloud device %s: %s",

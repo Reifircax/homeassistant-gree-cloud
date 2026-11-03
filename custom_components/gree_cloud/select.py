@@ -10,6 +10,7 @@ from greeclimate_davo22.device import Device
 from homeassistant.components.select import SelectEntity, SelectEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -152,7 +153,6 @@ class HeatPumpMode(GreeCloudEntity, SelectEntity):
 
     async def async_select_option(self, option):
         if option not in self.options:
-            from homeassistant.exceptions import HomeAssistantError
 
             raise HomeAssistantError("Unsupported mode")
         await self.coordinator.async_heatpump_command(

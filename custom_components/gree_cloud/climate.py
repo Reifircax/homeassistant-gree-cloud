@@ -40,6 +40,7 @@ from homeassistant.const import (
     UnitOfTemperature,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -52,6 +53,7 @@ from .const import (
 )
 from .coordinator import CloudDeviceDataUpdateCoordinator, GreeCloudConfigEntry, is_hwhp_device
 from .entity import GreeCloudEntity
+from .heatpump import MODE_NAMES, cooling_confirmed, setpoint, temperature
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -192,7 +194,6 @@ class GreeHeatPumpClimate(GreeCloudEntity, ClimateEntity):
 
     @property
     def hvac_modes(self):
-        from .heatpump import cooling_confirmed
         modes = [HVACMode.OFF, HVACMode.HEAT]
         if cooling_confirmed(self.coordinator.data or {}) or 5 in self.coordinator.device.write_policy.modes:
             modes.append(HVACMode.COOL)
@@ -212,18 +213,15 @@ class GreeHeatPumpClimate(GreeCloudEntity, ClimateEntity):
 
     @property
     def target_temperature(self):
-        from .heatpump import setpoint
         key = "CoWatOutTemSet" if self.hvac_mode == HVACMode.COOL else "HeWatOutTemSet"
         return setpoint(self.coordinator.data or {}, key)
 
     @property
     def current_temperature(self):
-        from .heatpump import temperature
         return temperature(self.coordinator.data or {}, "water_outlet_temperature")
 
     @property
     def extra_state_attributes(self):
-        from .heatpump import MODE_NAMES
         props = self.coordinator.data or {}
         return {"raw_mode": props.get("Mod"), "pac_mode": MODE_NAMES.get(props.get("Mod")),
                 "power": props.get("Pow"), "writes_enabled": bool(self.coordinator.device.write_policy.approved),
@@ -231,16 +229,13 @@ class GreeHeatPumpClimate(GreeCloudEntity, ClimateEntity):
 
     async def async_set_temperature(self, **kwargs):
         if not self.coordinator.device.write_policy.approved:
-            from homeassistant.exceptions import HomeAssistantError
             raise HomeAssistantError("Air-to-water writes are disabled pending protocol validation")
         if ATTR_HVAC_MODE in kwargs:
-            from homeassistant.exceptions import HomeAssistantError
             raise HomeAssistantError("Send mode and setpoint separately to avoid partial commands")
         key = "CoWatOutTemSet" if self.hvac_mode == HVACMode.COOL else "HeWatOutTemSet"
         await self.coordinator.async_heatpump_command(key, kwargs.get(ATTR_TEMPERATURE))
 
     async def async_set_hvac_mode(self, hvac_mode):
-        from homeassistant.exceptions import HomeAssistantError
         if not self.coordinator.device.write_policy.approved:
             raise HomeAssistantError("Air-to-water writes are disabled pending protocol validation")
         if hvac_mode == HVACMode.OFF:
@@ -259,7 +254,6 @@ class GreeHeatPumpClimate(GreeCloudEntity, ClimateEntity):
 
     async def async_turn_on(self):
         if "Pow" not in self.coordinator.device.write_policy.approved:
-            from homeassistant.exceptions import HomeAssistantError
             raise HomeAssistantError("Air-to-water power writes are disabled")
         await self.coordinator.async_heatpump_command("Pow", 1)
 
